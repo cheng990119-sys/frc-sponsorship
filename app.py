@@ -246,13 +246,12 @@ if "⚙️ 系統後台管理" in app_mode:
                         st.markdown(f"- **{record}** (早期紀錄)")
 
 # ==========================================
-# 模式 B：收件與回信匣 (新功能)
+# 模式 B：收件與回信匣
 # ==========================================
 elif "📥 收件與回信匣" in app_mode:
     st.title("📥 廠商回信與通知中心")
     st.markdown("系統會掃描團隊信箱，若有**已經寄出過企劃書的廠商 Email** 來信，會自動拉取至此，並在 Gmail 中移入指定資料夾。")
     
-    # 信箱連線設定 (自動帶入 Session)
     st.subheader("1. 郵件伺服器認證")
     col1, col2, col3 = st.columns([3, 3, 2])
     test_email = col1.text_input("團隊 Gmail 信箱", value=st.session_state.gmail_account).strip()
@@ -268,16 +267,13 @@ elif "📥 收件與回信匣" in app_mode:
                     mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
                     mail.login(test_email, test_pwd)
                     
-                    # 確保 Gmail 存在該資料夾
                     status, _ = mail.select(reply_folder)
                     if status != 'OK': mail.create(reply_folder)
                     
                     mail.select("INBOX")
-                    # 只搜尋未讀信件加速處理
                     status, messages = mail.search(None, "UNSEEN")
                     
                     if status == "OK" and messages[0]:
-                        # 建立已知廠商 Email 清單對照表 (Email -> [專案名稱, 廠商名稱])
                         sent_map = {}
                         for p_name, p_data in projects_db.items():
                             if "replies" not in p_data: p_data["replies"] = []
@@ -295,12 +291,10 @@ elif "📥 收件與回信匣" in app_mode:
                                     _, addr = parseaddr(from_header)
                                     addr_lower = addr.lower()
                                     
-                                    # [關鍵邏輯] 比對寄件人是否在我們的已發送名單中
                                     if addr_lower in sent_map:
                                         proj_name, company_name = sent_map[addr_lower]
                                         subject = decode_str(msg.get("Subject"))
                                         
-                                        # 擷取信件內容
                                         body = "無法解析文字內容"
                                         if msg.is_multipart():
                                             for part in msg.walk():
@@ -311,7 +305,6 @@ elif "📥 收件與回信匣" in app_mode:
                                             try: body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
                                             except: pass
                                             
-                                        # 寫入專案資料庫的 replies 陣列
                                         projects_db[proj_name]["replies"].append({
                                             "company": company_name,
                                             "email": addr,
@@ -322,7 +315,6 @@ elif "📥 收件與回信匣" in app_mode:
                                         })
                                         new_reply_count += 1
                                         
-                                        # 將信件複製到指定資料夾，並在收件匣標記刪除(歸檔)
                                         mail.copy(num, reply_folder)
                                         mail.store(num, '+FLAGS', '\\Deleted')
                         
@@ -344,7 +336,6 @@ elif "📥 收件與回信匣" in app_mode:
     st.subheader("2. 廠商回信匣")
     has_any_reply = False
     
-    # 渲染信件資料夾
     for p_name, p_data in projects_db.items():
         replies = p_data.get("replies", [])
         if not replies: continue
@@ -352,7 +343,7 @@ elif "📥 收件與回信匣" in app_mode:
         has_any_reply = True
         st.markdown(f"#### 📂 專案：{p_name}")
         
-        for idx, reply in enumerate(reversed(replies)): # 反轉清單，讓最新的信在最上面
+        for idx, reply in enumerate(reversed(replies)):
             real_idx = len(replies) - 1 - idx
             is_unread = not reply.get("read", True)
             icon = "🔴" if is_unread else "🟢"
@@ -420,7 +411,6 @@ elif "🏠 專案與寄信區" in app_mode:
             
         st.sidebar.divider()
         st.sidebar.header("🔐 寄件帳號設定")
-        # 輸入的同時同步更新至 session_state，讓收信匣也能直接用
         sender_email = st.sidebar.text_input("團隊 Gmail 信箱", value=st.session_state.gmail_account).strip()
         sender_password = st.sidebar.text_input("應用程式密碼", value=st.session_state.gmail_password, type="password").strip()
         st.session_state.gmail_account, st.session_state.gmail_password = sender_email, sender_password
@@ -454,6 +444,14 @@ elif "🏠 專案與寄信區" in app_mode:
                 if selected_company:
                     row_data = next((r for r in records if r.get('企業／贊助單位') == selected_company), {})
                     to_email = extract_email(row_data.get('聯絡資訊', ''))
+                    
+                    # ====== 🌟 新增的目標信箱顯示區塊 ======
+                    if to_email:
+                        st.success(f"📧 **即將寄出至 (目標信箱)：** `{to_email}`")
+                    else:
+                        st.error("⚠️ **警告：** 在 Excel 中找不到此廠商的有效 Email，將無法寄送！")
+                    # ====================================
+                    
                     pdf_filename = f"{str(row_data.get('編號', '000')).zfill(3)}_{selected_company}_贊助企劃書.pdf"
                     pdf_path = os.path.join(pdf_dir, pdf_filename)
                     
@@ -497,12 +495,11 @@ elif "🏠 專案與寄信區" in app_mode:
                                         imap.logout()
                                     except: pass
                                     
-                                    # [關鍵更新]：寫入紀錄時，必須儲存 "email" 供未來比對回信！
                                     if not is_sent:
                                         proj_data["sent_companies"].append({
                                             "company": selected_company,
                                             "sender": st.session_state.real_name,
-                                            "email": to_email  # <- 紀錄追蹤目標
+                                            "email": to_email
                                         })
                                         save_projects(projects_db)
                                     
