@@ -1,5 +1,4 @@
 import streamlit as st
-import pandas as pd
 import os
 import re
 import smtplib
@@ -7,61 +6,157 @@ import time
 import imaplib
 import json
 import hashlib
+import string
+from filelock import FileLock
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+import openpyxl
+
+# 可選 pandas 引用，具備純 Python 相容備援
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 
 # ==========================================
 # 網頁基本設定
 # ==========================================
 st.set_page_config(page_title="公關寄信系統", layout="wide")
 
-# 系統檔案路徑
+# 系統檔案路徑與鎖定檔 (併發保護)
 USERS_FILE = "users.json"
+USERS_LOCK = "users.json.lock"
 PROJECTS_FILE = "projects.json"
+PROJECTS_LOCK = "projects.json.lock"
 
 # ==========================================
-# 資料庫與輔助函式
+# 範本安全處理器 (Safe Formatter)
+# ==========================================
+class SafeFormatter(string.Formatter):
+    """安全範本替換，遇缺值的 `{var}` 或未定義大括號時保持原樣而不崩潰"""
+    def get_value(self, key, args, kwargs):
+        if isinstance(key, str):
+            return kwargs.get(key, f"{{{key}}}")
+        return super().get_value(key, args, kwargs)
+
+def safe_format_template(template, context_dict):
+    """安全格式化信件範本，防範 KeyError 與 ValueError"""
+    if not template:
+        return ""
+    try:
+        formatter = SafeFormatter()
+        return formatter.format(template, **context_dict)
+    except Exception:
+        res = str(template)
+        for k, v in context_dict.items():
+            res = res.replace(f"{{{k}}}", str(v))
+        return res
+
+# ==========================================
+# 資料庫與輔助函式 (線程與併發安全)
 # ==========================================
 def hash_password(password):
     """將密碼加密，保護帳號安全"""
     return hashlib.sha256(password.encode()).hexdigest()
 
+def safe_replace_file(src, dst, max_retries=5):
+    """Windows 平台檔案替換安全機制，防範 PermissionError 讀寫衝突"""
+    for attempt in range(max_retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(0.02)
+
 def load_users():
-    """讀取使用者資料，若無則建立預設管理員帳號"""
-    if not os.path.exists(USERS_FILE):
-        default_users = {
-            "admin": {
-                "password": hash_password("admin123"), 
-                "role": "admin",
-                "real_name": "系統管理員"
+    """讀取使用者資料，若無則建立預設管理員帳號 (支援檔案鎖防併發)"""
+    with FileLock(USERS_LOCK, timeout=10):
+        if not os.path.exists(USERS_FILE):
+            default_users = {
+                "admin": {
+                    "password": hash_password("admin123"), 
+                    "role": "admin",
+                    "real_name": "系統管理員"
+                }
             }
-        }
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_users, f, ensure_ascii=False, indent=4)
-        return default_users
-    with open(USERS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+            temp_file = f"{USERS_FILE}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(default_users, f, ensure_ascii=False, indent=4)
+            safe_replace_file(temp_file, USERS_FILE)
+            return default_users
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
 
 def save_users(users_data):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users_data, f, ensure_ascii=False, indent=4)
+    """保存使用者資料 (原子寫入 + 檔案鎖 + Windows 重試機制)"""
+    with FileLock(USERS_LOCK, timeout=10):
+        temp_file = f"{USERS_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(users_data, f, ensure_ascii=False, indent=4)
+        safe_replace_file(temp_file, USERS_FILE)
 
 def load_projects():
-    """讀取專案與寄件紀錄"""
-    if not os.path.exists(PROJECTS_FILE):
-        return {}
-    with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """讀取專案與寄件紀錄 (支援檔案鎖防併發)"""
+    with FileLock(PROJECTS_LOCK, timeout=10):
+        if not os.path.exists(PROJECTS_FILE):
+            return {}
+        with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return {}
 
 def save_projects(projects_data):
-    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(projects_data, f, ensure_ascii=False, indent=4)
+    """保存專案資料 (原子寫入 + 檔案鎖 + Windows 重試機制)"""
+    with FileLock(PROJECTS_LOCK, timeout=10):
+        temp_file = f"{PROJECTS_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(projects_data, f, ensure_ascii=False, indent=4)
+        safe_replace_file(temp_file, PROJECTS_FILE)
 
 def extract_email(contact_str):
-    if pd.isna(contact_str): return None
+    """安全解析聯絡資訊中的 Email 地址"""
+    if not contact_str or str(contact_str).lower() in ("nan", "none", "null"): 
+        return None
     match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', str(contact_str))
     return match.group(0) if match else None
+
+def read_excel_data(uploaded_file):
+    """高效且相容的 Excel 解析函式 (支援 openpyxl 與 pandas)"""
+    if pd is not None:
+        try:
+            df = pd.read_excel(uploaded_file, sheet_name="全部彙總清單")
+            return df.to_dict(orient="records")
+        except Exception:
+            try:
+                df = pd.read_excel(uploaded_file, sheet_name=0)
+                return df.to_dict(orient="records")
+            except Exception:
+                pass
+
+    try:
+        wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+        sheet_name = "全部彙總清單" if "全部彙總清單" in wb.sheetnames else wb.sheetnames[0]
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+        headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+        data = []
+        for row in rows[1:]:
+            if any(c is not None for c in row):
+                row_dict = {headers[i]: (row[i] if i < len(row) and row[i] is not None else "") for i in range(len(headers))}
+                data.append(row_dict)
+        return data
+    except Exception as e:
+        st.error(f"❌ Excel 讀取失敗：{e}")
+        return []
 
 # 預設信件模板
 DEFAULT_TEMPLATE = """尊敬的 {企業／贊助單位} 貴賓與團隊 您好：\n\n我們是來自台灣的高中機器人競賽團隊【{team_name}】。\n\n考量到團隊在【{潛在贊助項目／形式}】的需求，希望能有機會向貴公司爭取支持與合作（{說明與贊助契機}）。\n\n我們為貴單位量身編製了專屬贊助合作企劃書，隨信檢附如附件：\n▶ 專屬企劃書：{pdf_filename}\n\n若有任何需要進一步討論之處，非常歡迎隨時聯繫。由衷感謝您撥冗閱讀！\n\n敬祝 商祺\n\n【{team_name}】公關團隊\n聯絡人：{contact_person}\n聯絡電話：{contact_phone}\n隊伍信箱：{sender_email}"""
@@ -87,8 +182,8 @@ if not st.session_state.logged_in:
     st.markdown("請輸入您的專屬帳號與密碼以登入系統。")
     
     with st.form("login_form"):
-        login_user = st.text_input("帳號 (Username)")
-        login_pwd = st.text_input("密碼 (Password)", type="password")
+        login_user = st.text_input("帳號 (Username)").strip()
+        login_pwd = st.text_input("密碼 (Password)", type="password").strip()
         submit_login = st.form_submit_button("登入", type="primary")
         
         if submit_login:
@@ -137,9 +232,9 @@ if app_mode == "⚙️ 系統後台管理":
         st.subheader("建立新帳號")
         with st.form("add_user_form"):
             c1, c2, c3 = st.columns(3)
-            new_username = c1.text_input("登入帳號 (英文/數字)")
-            new_realname = c2.text_input("成員姓名")
-            new_password = c3.text_input("預設密碼", type="password")
+            new_username = c1.text_input("登入帳號 (英文/數字)").strip()
+            new_realname = c2.text_input("成員姓名").strip()
+            new_password = c3.text_input("預設密碼", type="password").strip()
             new_role = st.selectbox("帳號權限", ["user (一般成員)", "admin (管理員)"])
             
             if st.form_submit_button("新增帳號", type="primary"):
@@ -152,7 +247,7 @@ if app_mode == "⚙️ 系統後台管理":
                     users_db[new_username] = {
                         "password": hash_password(new_password),
                         "role": "admin" if "admin" in new_role else "user",
-                        "real_name": new_realname
+                        "real_name": new_realname if new_realname else new_username
                     }
                     save_users(users_db)
                     st.success(f"✅ 成功建立帳號：{new_realname} ({new_username})")
@@ -161,8 +256,8 @@ if app_mode == "⚙️ 系統後台管理":
         users_db = load_users()
         user_list = []
         for u, d in users_db.items():
-            user_list.append({"帳號": u, "姓名": d.get("real_name", u), "權限": d["role"]})
-        st.table(pd.DataFrame(user_list))
+            user_list.append({"帳號": u, "姓名": d.get("real_name", u), "權限": d.get("role", "user")})
+        st.table(user_list)
 
     with tab2:
         st.subheader("📂 專案進度與紀錄總覽")
@@ -174,9 +269,8 @@ if app_mode == "⚙️ 系統後台管理":
                 with st.expander(f"📁 專案：{p_name} (已寄出 {len(sent_list)} 封)"):
                     if sent_list:
                         for record in sent_list:
-                            # 顯示 廠商名稱 - 寄件者
                             if isinstance(record, dict):
-                                st.markdown(f"- **{record['company']}** (寄件人: {record['sender']})")
+                                st.markdown(f"- **{record.get('company', '未知公司')}** (寄件人: {record.get('sender', '未知')})")
                             else:
                                 st.markdown(f"- **{record}** (早期紀錄)")
                     else:
@@ -197,9 +291,9 @@ elif app_mode == "🏠 專案與寄信區":
         with col_new:
             st.subheader("➕ 建立新專案")
             with st.form("new_project_form"):
-                new_proj_name = st.text_input("為您的新專案命名：")
+                new_proj_name = st.text_input("為您的新專案命名：").strip()
                 if st.form_submit_button("建立專案", type="primary", use_container_width=True):
-                    if not new_proj_name.strip():
+                    if not new_proj_name:
                         st.error("專案名稱不能為空！")
                     elif new_proj_name in projects_db:
                         st.error("此專案已經存在！")
@@ -229,7 +323,6 @@ elif app_mode == "🏠 專案與寄信區":
                                 st.session_state.page = "project"
                                 st.rerun()
                         with c3:
-                            # 只有管理員可以刪除專案
                             if st.session_state.role == "admin":
                                 if st.button("🗑️ 刪除", key=f"del_{proj_name}", use_container_width=True):
                                     del projects_db[proj_name]
@@ -251,24 +344,23 @@ elif app_mode == "🏠 專案與寄信區":
             
         st.sidebar.divider()
         st.sidebar.header("🔐 寄件帳號設定")
-        sender_email = st.sidebar.text_input("團隊 Gmail 信箱", placeholder="your_team@gmail.com")
-        sender_password = st.sidebar.text_input("應用程式密碼", type="password", placeholder="xxxx xxxx xxxx xxxx")
+        sender_email = st.sidebar.text_input("團隊 Gmail 信箱", placeholder="your_team@gmail.com").strip()
+        sender_password = st.sidebar.text_input("應用程式密碼", type="password", placeholder="xxxx xxxx xxxx xxxx").strip()
         
         st.sidebar.header("📂 系統設定")
-        pdf_dir = st.sidebar.text_input("附件資料夾名稱", value="企劃書檔案")
-        backup_folder = st.sidebar.text_input("Gmail 備份標籤名稱", value="FRC_Sponsorship")
+        pdf_dir = st.sidebar.text_input("附件資料夾名稱", value="企劃書檔案").strip()
+        backup_folder = st.sidebar.text_input("Gmail 備份標籤名稱", value="FRC_Sponsorship").strip()
 
         st.title(f"📁 專案：{current_proj}")
         st.divider()
 
         st.header("Step 1: 團隊資訊與信件格式")
         col1, col2, col3 = st.columns(3)
-        team_name = col1.text_input("團隊名稱", value="FRC 團隊名稱")
-        contact_person = col2.text_input("聯絡人姓名", value=st.session_state.real_name)
-        contact_phone = col3.text_input("聯絡電話", value="0912-345-678")
+        team_name = col1.text_input("團隊名稱", value="FRC 團隊名稱").strip()
+        contact_person = col2.text_input("聯絡人姓名", value=st.session_state.real_name).strip()
+        contact_phone = col3.text_input("聯絡電話", value="0912-345-678").strip()
 
         email_template = st.text_area("✏️ 信件內容編輯區", value=proj_data.get("template", DEFAULT_TEMPLATE), height=250)
-        # 即時存檔模板
         if email_template != proj_data.get("template"):
             projects_db[current_proj]["template"] = email_template
             save_projects(projects_db)
@@ -277,102 +369,102 @@ elif app_mode == "🏠 專案與寄信區":
         uploaded_file = st.file_uploader("上傳贊助商名單 (.xlsx)", type=["xlsx"])
 
         if uploaded_file is not None:
-            df = pd.read_excel(uploaded_file, sheet_name="全部彙總清單")
-            
-            with st.expander("👀 查看完整贊助商名單"):
-                st.dataframe(df)
+            records = read_excel_data(uploaded_file)
 
-            st.header("Step 3: 檢視與寄出")
-            company_list = df['企業／贊助單位'].dropna().unique().tolist()
-            selected_company = st.selectbox("🔍 選擇要處理的廠商", company_list)
+            if records:
+                with st.expander("👀 查看完整贊助商名單"):
+                    st.table(records[:20])  # 展示前 20 筆記錄
 
-            if selected_company:
-                row_data = df[df['企業／贊助單位'] == selected_company].iloc[0]
-                company_id = str(row_data['編號']).zfill(3)
-                to_email = extract_email(row_data['聯絡資訊'])
+                st.header("Step 3: 檢視與寄出")
+                company_list = list(set([r.get('企業／贊助單位', '') for r in records if r.get('企業／贊助單位')]))
                 
-                st.subheader(f"💡 【{selected_company}】專屬備註")
-                st.info(row_data.get('說明與贊助契機', '無備註資料'))
-                
-                pdf_filename = f"{company_id}_{selected_company}_贊助企劃書.pdf"
-                pdf_path = os.path.join(pdf_dir, pdf_filename)
-                
-                format_dict = row_data.to_dict()
-                format_dict.update({
-                    "team_name": team_name, "contact_person": contact_person,
-                    "contact_phone": contact_phone, "sender_email": sender_email if sender_email else "尚未填寫",
-                    "pdf_filename": pdf_filename
-                })
-                
-                try:
-                    preview_text = email_template.format(**format_dict)
-                    st.markdown("### 📝 信件預覽")
-                    st.text(preview_text)
-                    st.markdown("---")
-                    
-                    # 檢查是否已寄出 (支援新舊資料結構)
-                    sent_list = proj_data.get("sent_companies", [])
-                    is_sent = any(isinstance(r, dict) and r["company"] == selected_company for r in sent_list) or (selected_company in sent_list)
-                    
-                    btn_col1, btn_col2 = st.columns([2, 8])
-                    with btn_col1:
-                        btn_text = "🚀 再次寄送" if is_sent else f"🚀 確定寄送"
-                        if st.button(btn_text, type="primary"):
-                            if not sender_email or not sender_password:
-                                st.error("⚠️ 請先在左側欄填寫寄件帳號設定！")
-                            elif not to_email:
-                                st.error("⚠️ 此廠商沒有 Email！")
-                            else:
-                                with st.spinner('正在寄送信件與備份中...'):
-                                    try:
-                                        server = smtplib.SMTP("smtp.gmail.com", 587)
-                                        server.starttls()
-                                        server.login(sender_email, sender_password)
-                                        
-                                        subject = f"【贊助合作邀請】{team_name} 赴美參賽企劃書 — 敬致 {selected_company}"
-                                        msg = MIMEMultipart()
-                                        msg['From'], msg['To'], msg['Subject'] = sender_email, to_email, subject
-                                        msg.attach(MIMEText(preview_text, 'plain', 'utf-8'))
-                                        
-                                        if os.path.exists(pdf_path):
-                                            with open(pdf_path, 'rb') as f:
-                                                attach = MIMEApplication(f.read(), _subtype="pdf")
-                                                attach.add_header('Content-Disposition', 'attachment', filename=pdf_filename)
-                                                msg.attach(attach)
-                                                
-                                        server.send_message(msg)
-                                        server.quit()
-                                        
-                                        backup_status = ""
+                if company_list:
+                    selected_company = st.selectbox("🔍 選擇要處理的廠商", company_list)
+
+                    if selected_company:
+                        row_data = next((r for r in records if r.get('企業／贊助單位') == selected_company), {})
+                        company_id = str(row_data.get('編號', '000')).zfill(3)
+                        to_email = extract_email(row_data.get('聯絡資訊', ''))
+                        
+                        st.subheader(f"💡 【{selected_company}】專屬備註")
+                        st.info(row_data.get('說明與贊助契機', '無備註資料'))
+                        
+                        pdf_filename = f"{company_id}_{selected_company}_贊助企劃書.pdf"
+                        pdf_path = os.path.join(pdf_dir, pdf_filename)
+                        
+                        format_dict = dict(row_data)
+                        format_dict.update({
+                            "team_name": team_name, "contact_person": contact_person,
+                            "contact_phone": contact_phone, "sender_email": sender_email if sender_email else "尚未填寫",
+                            "pdf_filename": pdf_filename
+                        })
+                        
+                        # 使用安全範本替換引擎，防止 KeyError 與 ValueError 崩潰
+                        preview_text = safe_format_template(email_template, format_dict)
+                        st.markdown("### 📝 信件預覽")
+                        st.text(preview_text)
+                        st.markdown("---")
+                        
+                        sent_list = proj_data.get("sent_companies", [])
+                        is_sent = any(isinstance(r, dict) and r.get("company") == selected_company for r in sent_list) or (selected_company in sent_list)
+                        
+                        btn_col1, btn_col2 = st.columns([2, 8])
+                        with btn_col1:
+                            btn_text = "🚀 再次寄送" if is_sent else f"🚀 確定寄送"
+                            if st.button(btn_text, type="primary"):
+                                if not sender_email or not sender_password:
+                                    st.error("⚠️ 請先在左側欄填寫寄件帳號設定！")
+                                elif not to_email:
+                                    st.error("⚠️ 此廠商沒有有效的 Email！")
+                                else:
+                                    with st.spinner('正在寄送信件與備份中...'):
                                         try:
-                                            imap = imaplib.IMAP4_SSL("imap.gmail.com")
-                                            imap.login(sender_email, sender_password)
-                                            status, response = imap.select(backup_folder)
-                                            if status != 'OK': imap.create(backup_folder)
-                                            imap.append(backup_folder, '\\Seen', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
-                                            imap.logout()
-                                            backup_status = f"且已備份至 Gmail"
+                                            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=10)
+                                            server.starttls()
+                                            server.login(sender_email, sender_password)
+                                            
+                                            subject = f"【贊助合作邀請】{team_name} 赴美參賽企劃書 — 敬致 {selected_company}"
+                                            msg = MIMEMultipart()
+                                            msg['From'], msg['To'], msg['Subject'] = sender_email, to_email, subject
+                                            msg.attach(MIMEText(preview_text, 'plain', 'utf-8'))
+                                            
+                                            if os.path.exists(pdf_path):
+                                                with open(pdf_path, 'rb') as f:
+                                                    attach = MIMEApplication(f.read(), _subtype="pdf")
+                                                    attach.add_header('Content-Disposition', 'attachment', filename=pdf_filename)
+                                                    msg.attach(attach)
+                                                    
+                                            server.send_message(msg)
+                                            server.quit()
+                                            
+                                            backup_status = ""
+                                            try:
+                                                imap = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
+                                                imap.login(sender_email, sender_password)
+                                                status, response = imap.select(backup_folder)
+                                                if status != 'OK': imap.create(backup_folder)
+                                                imap.append(backup_folder, '\\Seen', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+                                                imap.logout()
+                                                backup_status = f"且已備份至 Gmail"
+                                            except Exception:
+                                                pass
+                                            
+                                            if not is_sent:
+                                                proj_data["sent_companies"].append({
+                                                    "company": selected_company,
+                                                    "sender": st.session_state.real_name
+                                                })
+                                                save_projects(projects_db)
+                                            
+                                            st.success(f"✅ 成功寄出 {backup_status}！")
+                                            time.sleep(1.5)
+                                            st.rerun()
+                                            
                                         except Exception as e:
-                                            pass
-                                        
-                                        # 寫入寄件紀錄，包含是誰寄的
-                                        if not is_sent:
-                                            proj_data["sent_companies"].append({
-                                                "company": selected_company,
-                                                "sender": st.session_state.real_name
-                                            })
-                                            save_projects(projects_db)
-                                        
-                                        st.success(f"✅ 成功寄出 {backup_status}！")
-                                        time.sleep(1.5)
-                                        st.rerun()
-                                        
-                                    except Exception as e:
-                                        st.error(f"❌ 寄件失敗：{e}")
-                    
-                    with btn_col2:
-                        if is_sent:
-                            st.success("✅ 已寄出")
-                            
-                except KeyError as e:
-                    st.error(f"⚠️ 變數錯誤：{e}")
+                                            st.error(f"❌ 寄件失敗：{e}")
+                        
+                        with btn_col2:
+                            if is_sent:
+                                st.success("✅ 已寄出")
+                else:
+                    st.warning("⚠️ Excel 未找到有效的廠商資料與『企業／贊助單位』欄位！")
