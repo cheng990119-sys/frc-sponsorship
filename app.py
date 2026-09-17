@@ -246,7 +246,7 @@ if "⚙️ 系統後台管理" in app_mode:
                         st.markdown(f"- **{record}** (早期紀錄)")
 
 # ==========================================
-# 模式 B：收件與回信匣
+# 模式 B：收件與回信匣 (極速效能優化版)
 # ==========================================
 elif "📥 收件與回信匣" in app_mode:
     st.title("📥 廠商回信與通知中心")
@@ -262,7 +262,7 @@ elif "📥 收件與回信匣" in app_mode:
         if not test_email or not test_pwd:
             st.error("請輸入信箱與應用程式密碼！")
         else:
-            with st.spinner("正在連線 Gmail 檢查新郵件，請稍候..."):
+            with st.spinner("🚀 正在極速掃描 Gmail 未讀信件，請稍候..."):
                 try:
                     mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=15)
                     mail.login(test_email, test_pwd)
@@ -282,41 +282,59 @@ elif "📥 收件與回信匣" in app_mode:
                                     sent_map[record["email"].lower()] = (p_name, record.get("company"))
 
                         new_reply_count = 0
-                        for num in messages[0].split():
-                            res, msg_data = mail.fetch(num, "(RFC822)")
-                            for response_part in msg_data:
+                        msg_nums = messages[0].split()
+                        
+                        # 🚀 優化 1：最多只掃描最新 100 封未讀信件，防止信箱爆滿拖慢速度
+                        if len(msg_nums) > 100:
+                            msg_nums = msg_nums[-100:]
+
+                        for num in msg_nums:
+                            # 🚀 優化 2：先偷看標頭 (BODY.PEEK[HEADER.FIELDS (FROM)])。不用下載龐大的內文與附件！
+                            res, header_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+                            for response_part in header_data:
                                 if isinstance(response_part, tuple):
-                                    msg = email.message_from_bytes(response_part[1])
-                                    from_header = decode_str(msg.get("From"))
+                                    header_msg = email.message_from_bytes(response_part[1])
+                                    from_header = decode_str(header_msg.get("From"))
                                     _, addr = parseaddr(from_header)
                                     addr_lower = addr.lower()
                                     
+                                    # 🚀 優化 3：只有「確定是我們寄過的廠商」，才真正去下載整封信
                                     if addr_lower in sent_map:
                                         proj_name, company_name = sent_map[addr_lower]
-                                        subject = decode_str(msg.get("Subject"))
                                         
-                                        body = "無法解析文字內容"
-                                        if msg.is_multipart():
-                                            for part in msg.walk():
-                                                if part.get_content_type() == "text/plain":
-                                                    try: body = part.get_payload(decode=True).decode('utf-8', errors='ignore'); break
+                                        # 確定是目標廠商，此時才下載完整信件 (RFC822)
+                                        res, full_msg_data = mail.fetch(num, "(RFC822)")
+                                        for full_response_part in full_msg_data:
+                                            if isinstance(full_response_part, tuple):
+                                                msg = email.message_from_bytes(full_response_part[1])
+                                                subject = decode_str(msg.get("Subject"))
+                                                
+                                                body = "無法解析文字內容"
+                                                if msg.is_multipart():
+                                                    for part in msg.walk():
+                                                        if part.get_content_type() == "text/plain":
+                                                            try: body = part.get_payload(decode=True).decode('utf-8', errors='ignore'); break
+                                                            except: pass
+                                                else:
+                                                    try: body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
                                                     except: pass
-                                        else:
-                                            try: body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                            except: pass
-                                            
-                                        projects_db[proj_name]["replies"].append({
-                                            "company": company_name,
-                                            "email": addr,
-                                            "subject": subject,
-                                            "body": body,
-                                            "read": False,
-                                            "time": time.strftime("%Y-%m-%d %H:%M")
-                                        })
-                                        new_reply_count += 1
-                                        
-                                        mail.copy(num, reply_folder)
-                                        mail.store(num, '+FLAGS', '\\Deleted')
+                                                
+                                                # 🚀 優化 4：限制儲存的內文長度，避免過長拖慢資料庫與網頁
+                                                clipped_body = body[:1000] + ("\n\n...(內容過長已省略，請至 Gmail 查看全文)" if len(body)>1000 else "")
+                                                    
+                                                projects_db[proj_name]["replies"].append({
+                                                    "company": company_name,
+                                                    "email": addr,
+                                                    "subject": subject,
+                                                    "body": clipped_body,
+                                                    "read": False,
+                                                    "time": time.strftime("%Y-%m-%d %H:%M")
+                                                })
+                                                new_reply_count += 1
+                                                
+                                                # 歸檔
+                                                mail.copy(num, reply_folder)
+                                                mail.store(num, '+FLAGS', '\\Deleted')
                         
                         mail.expunge()
                         if new_reply_count > 0:
@@ -445,7 +463,7 @@ elif "🏠 專案與寄信區" in app_mode:
                     row_data = next((r for r in records if r.get('企業／贊助單位') == selected_company), {})
                     to_email = extract_email(row_data.get('聯絡資訊', ''))
                     
-                    # ====== 🌟 新增的目標信箱顯示區塊 ======
+                    # ====== 🌟 目標信箱顯示區塊 ======
                     if to_email:
                         st.success(f"📧 **即將寄出至 (目標信箱)：** `{to_email}`")
                     else:
