@@ -16,6 +16,13 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 import openpyxl
 
+# 獨立導入資安模組 (維持檔案分離與模組化架構)
+from security import (
+    verify_password, generate_salted_password_hash, is_legacy_hash,
+    scraping_detector, log_security_event, get_recent_security_logs,
+    check_session_timeout
+)
+
 try:
     import pandas as pd
 except ImportError:
@@ -70,9 +77,6 @@ def safe_format_template(template, context_dict):
 # ==========================================
 # 資料庫與系統安全函式
 # ==========================================
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
 def safe_replace_file(src, dst, max_retries=5):
     for attempt in range(max_retries):
         try:
@@ -85,7 +89,8 @@ def safe_replace_file(src, dst, max_retries=5):
 def load_users():
     with FileLock(USERS_LOCK, timeout=10):
         if not os.path.exists(USERS_FILE):
-            default_users = {"admin": {"password": hash_password("admin123"), "role": "admin", "real_name": "系統管理員"}}
+            # 預設管理員帳號使用 PBKDF2 加鹽加密
+            default_users = {"admin": {"password": generate_salted_password_hash("admin123"), "role": "admin", "real_name": "系統管理員"}}
             temp_file = f"{USERS_FILE}.tmp"
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(default_users, f, ensure_ascii=False, indent=4)
@@ -150,20 +155,31 @@ def read_excel_data(uploaded_file):
 DEFAULT_TEMPLATE = """尊敬的 {企業／贊助單位} 貴賓與團隊 您好：\n\n我們是來自台灣的高中機器人競賽團隊【{team_name}】。\n\n期盼能有機會向貴公司爭取支持與合作（{說明與贊助契機}）。隨信檢附專屬企劃書：\n▶ 專屬企劃書：{pdf_filename}\n\n敬祝 商祺\n\n【{team_name}】公關團隊\n聯絡人：{contact_person}\n聯絡電話：{contact_phone}"""
 
 # ==========================================
-# 狀態初始化
+# 狀態初始化與 30 分鐘會話超時檢查
 # ==========================================
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.username = ""
     st.session_state.role = ""
     st.session_state.real_name = ""
+    st.session_state.last_active = time.time()
 if "page" not in st.session_state: st.session_state.page = "home"
 if "current_project" not in st.session_state: st.session_state.current_project = None
 if "gmail_account" not in st.session_state: st.session_state.gmail_account = ""
 if "gmail_password" not in st.session_state: st.session_state.gmail_password = ""
 
+# 檢查會話閒置超時 (30 分鐘無操作自動銷毀 Session)
+if st.session_state.logged_in:
+    if check_session_timeout(st.session_state.get("last_active", 0), timeout_seconds=1800):
+        log_security_event("SESSION_TIMEOUT", st.session_state.username, "EXPIRED", "閒置超過 30 分鐘自動登出")
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.sidebar.error("⚠️ 會話因閒置超過 30 分鐘已自動安全登出，請重新登入！")
+        st.rerun()
+    st.session_state.last_active = time.time()
+
 # ==========================================
-# 登入介面
+# 登入介面 (整合 security.py PBKDF2 與日誌)
 # ==========================================
 if not st.session_state.logged_in:
     st.title("🔐 公關寄信系統")
@@ -173,12 +189,22 @@ if not st.session_state.logged_in:
         login_pwd = st.text_input("密碼", type="password").strip()
         if st.form_submit_button("登入", type="primary"):
             users_db = load_users()
-            if login_user in users_db and users_db[login_user]["password"] == hash_password(login_pwd):
+            if login_user in users_db and verify_password(users_db[login_user]["password"], login_pwd):
                 st.session_state.logged_in = True
                 st.session_state.username, st.session_state.role = login_user, users_db[login_user]["role"]
                 st.session_state.real_name = users_db[login_user].get("real_name", login_user)
+                st.session_state.last_active = time.time()
+                
+                # 自動對舊版 SHA-256 密碼執行 PBKDF2 加鹽無感升級
+                if is_legacy_hash(users_db[login_user]["password"]):
+                    users_db[login_user]["password"] = generate_salted_password_hash(login_pwd)
+                    save_users(users_db)
+                    log_security_event("CREDENTIAL_UPGRADE", login_user, "SUCCESS", "密碼無感升級為 PBKDF2 加鹽雜湊")
+                
+                log_security_event("LOGIN_SUCCESS", login_user, "SUCCESS", f"登入成功 ({users_db[login_user]['role']})")
                 st.rerun()
             else:
+                log_security_event("LOGIN_FAILURE", login_user if login_user else "GUEST", "FAILURE", "登入密碼驗證失敗")
                 st.error("⚠️ 帳號或密碼錯誤！")
     st.stop()
 
@@ -195,6 +221,7 @@ for p_data in projects_db.values():
 
 st.sidebar.markdown(f"👤 登入者：**{st.session_state.real_name}**")
 if st.sidebar.button("🚪 登出", use_container_width=True):
+    log_security_event("LOGOUT", st.session_state.username, "SUCCESS", "使用者手動登出")
     st.session_state.logged_in = False
     st.rerun()
 st.sidebar.divider()
@@ -208,11 +235,11 @@ app_mode = st.sidebar.radio("📌 系統功能導覽", nav_options)
 st.sidebar.divider()
 
 # ==========================================
-# 模式 A：系統後台管理
+# 模式 A：系統後台管理 (整合資安稽核日誌)
 # ==========================================
 if "⚙️ 系統後台管理" in app_mode:
     st.title("⚙️ 系統後台管理")
-    tab1, tab2 = st.tabs(["👥 帳號管理", "📊 團隊寄件總覽"])
+    tab1, tab2, tab3 = st.tabs(["👥 帳號管理", "📊 團隊寄件總覽", "🛡️ 資安稽核日誌"])
     
     with tab1:
         st.subheader("建立新帳號")
@@ -227,8 +254,13 @@ if "⚙️ 系統後台管理" in app_mode:
                 if n_usr in users_db: st.error("帳號已存在！")
                 elif not n_usr or not n_pwd: st.error("不得為空！")
                 else:
-                    users_db[n_usr] = {"password": hash_password(n_pwd), "role": "admin" if "admin" in n_role else "user", "real_name": n_name or n_usr}
+                    users_db[n_usr] = {
+                        "password": generate_salted_password_hash(n_pwd), 
+                        "role": "admin" if "admin" in n_role else "user", 
+                        "real_name": n_name or n_usr
+                    }
                     save_users(users_db)
+                    log_security_event("USER_CREATE", st.session_state.username, "SUCCESS", f"建立帳號 {n_usr} ({n_name})")
                     st.success(f"成功建立帳號：{n_name}")
         st.table([{"帳號": u, "姓名": d.get("real_name", u), "權限": d.get("role", "user")} for u, d in load_users().items()])
 
@@ -242,6 +274,15 @@ if "⚙️ 系統後台管理" in app_mode:
                         st.markdown(f"- **{record.get('company', '?')}** (Email: {record.get('email', '未記錄')} | 寄件: {record.get('sender', '?')})")
                     else:
                         st.markdown(f"- **{record}** (早期紀錄)")
+
+    with tab3:
+        st.subheader("🛡️ 系統資安稽核日誌 (security_audit.log)")
+        st.markdown("顯示全系統最近的認證事件、資料存取與外網異常擷取警報：")
+        logs = get_recent_security_logs(100)
+        if not logs:
+            st.info("目前尚無資安稽核紀錄。")
+        else:
+            st.code("\n".join(logs), language="log")
 
 # ==========================================
 # 模式 B：收件與回信匣 (強制掃描與除錯版)
@@ -262,7 +303,7 @@ elif "📥 收件與回信匣" in app_mode:
         else:
             with st.spinner("🚀 正在強制掃描 Gmail 近 3 天內所有信件，請稍候..."):
                 try:
-                    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=20)
+                    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
                     mail.login(test_email, test_pwd)
                     
                     status, _ = mail.select(reply_folder)
@@ -395,7 +436,7 @@ elif "📥 收件與回信匣" in app_mode:
 
 
 # ==========================================
-# 模式 C：專案與寄信區
+# 模式 C：專案與寄信區 (整合外網異常擷取偵測)
 # ==========================================
 elif "🏠 專案與寄信區" in app_mode:
     if st.session_state.page == "home":
@@ -412,6 +453,7 @@ elif "🏠 專案與寄信區" in app_mode:
                     else:
                         projects_db[new_proj_name] = {"sent_companies": [], "template": DEFAULT_TEMPLATE, "replies": []}
                         save_projects(projects_db)
+                        log_security_event("PROJECT_CREATE", st.session_state.username, "SUCCESS", f"建立新專案: {new_proj_name}")
                         st.rerun()
 
         with col_list:
@@ -431,6 +473,7 @@ elif "🏠 專案與寄信區" in app_mode:
                         if st.session_state.role == "admin" and st.button("🗑️ 刪除", key=f"del_{proj_name}", use_container_width=True):
                             del projects_db[proj_name]
                             save_projects(projects_db)
+                            log_security_event("PROJECT_DELETE", st.session_state.username, "WARNING", f"刪除專案: {proj_name}")
                             st.rerun()
 
     elif st.session_state.page == "project":
@@ -474,6 +517,14 @@ elif "🏠 專案與寄信區" in app_mode:
                 selected_company = st.selectbox("🔍 選擇廠商", company_list) if company_list else None
                 
                 if selected_company:
+                    # 呼叫資安模組 security.py 檢查外網異常資料擷取頻率
+                    is_suspicious, count, warn_msg = scraping_detector.record_access(
+                        st.session_state.username or "Guest", threshold_per_minute=30
+                    )
+                    if is_suspicious:
+                        st.warning(warn_msg)
+                        log_security_event("SCRAPING_WARNING", st.session_state.username, "WARNING", warn_msg)
+
                     row_data = next((r for r in records if r.get('企業／贊助單位') == selected_company), {})
                     to_email = extract_email(row_data.get('聯絡資訊', ''))
                     
@@ -533,8 +584,10 @@ elif "🏠 專案與寄信區" in app_mode:
                                         })
                                         save_projects(projects_db)
                                     
+                                    log_security_event("MAIL_SEND", st.session_state.username, "SUCCESS", f"成功寄出企劃書至 {selected_company} ({to_email})")
                                     st.success("✅ 寄出成功！")
                                     time.sleep(1.5)
                                     st.rerun()
                                 except Exception as e:
+                                    log_security_event("MAIL_SEND_FAIL", st.session_state.username, "FAILURE", f"寄件失敗 ({selected_company}): {e}")
                                     st.error(f"❌ 寄件失敗：{e}")
